@@ -76,7 +76,9 @@ cd /home/archer/projects/pi-unica
 --dry-run              показать план без выполнения
 ```
 
-## Установка из архива (офлайн, без cargo и сети)
+## Установка из архива (офлайн, без cargo и сети) для windows
+
+собрать архивы командой `./scripts/package.sh --all`
 
 Готовые архивы собираются в `dist/` скриптом `scripts/package.sh` (см. ниже):
 `pi-unica-linux-x64.tar.gz` и `pi-unica-win-x64.tar.gz`. Архив самодостаточен —
