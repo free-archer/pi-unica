@@ -1,0 +1,34 @@
+{
+  "name": "pi-unica",
+  "version": "0.1.0",
+  "description": "Practical 1C:Enterprise development workflows for pi: metadata, forms, roles, DCS/MXL layouts, EPF/ERF artifacts, runtime builds and BSL search/review/diagnostics, routed through the unica Rust MCP server via pi-mcp-adapter.",
+  "keywords": [
+    "pi-package",
+    "1c",
+    "1c-enterprise",
+    "bsl",
+    "metadata",
+    "epf",
+    "erf",
+    "cfe",
+    "forms",
+    "mcp",
+    "v8-runner",
+    "rlm",
+    "code-analysis"
+  ],
+  "license": "LGPL-3.0-or-later",
+  "author": {
+    "name": "Ingvar Consulting, LLC",
+    "url": "https://ingvar.pro"
+  },
+  "repository": "https://github.com/IngvarConsulting/unica",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  }
+}

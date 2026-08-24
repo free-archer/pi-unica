@@ -1,0 +1,92 @@
+---
+name: mxl-decompile
+description: Декомпиляция табличного документа (MXL) в JSON-определение. Используй когда нужно получить редактируемое описание существующего макета
+allowed-tools: bash read write find
+---
+
+
+# /mxl-decompile — Декомпилятор макета в DSL
+
+## MCP routing
+
+Все инструменты `unica.*` вызываются через прокси pi-mcp-adapter: `mcp({ tool: "unica.<tool>", args: { ... } })`; полный список — `mcp({ server: "unica" })`.
+
+- Preferred path: call `mcp({ tool: "unica.mxl.decompile", args: { ... } })`; `unica` owns XML/JSON DSL work and refreshes related workspace caches after mutations.
+- Do not call internal MCP/CLI adapters directly. They are hidden behind `unica` and synchronized by the orchestrator.
+- Execution path: call MCP `unica` tool `unica.mxl.decompile`; skill-local operation scripts are not part of the workflow.
+- For mutating operations, pass `dryRun: false` only when the user explicitly requested the change; otherwise keep the default dry run.
+
+Принимает Template.xml табличного документа 1С и возвращает компактное JSON-определение (DSL) в ответе MCP. Не создаёт файлов. Обратная операция к MCP `unica.mxl.compile`.
+
+## Использование
+
+```text
+/mxl-decompile <TemplatePath>
+```
+
+## Параметры
+
+| Параметр     | Обязательный | Описание            |
+|--------------|:------------:|---------------------|
+| TemplatePath | один из двух | Путь к Template.xml |
+| sourceSet    | один из двух | Имя набора исходников из `v8project.yaml` |
+| metadataPath | один из двух | Логический адрес, например `Report.<Отчёт>.Template.<Макет>` |
+
+Селектор цели ровно один: либо `sourceSet` + `metadataPath`, либо
+`TemplatePath`. Оба сразу отклоняются кодом `selector_conflict` (ADR-0049).
+
+## MCP вызов
+
+```js
+mcp({
+  tool: "unica.mxl.decompile",
+  args: {
+    "cwd": "<workspace>",
+    "TemplatePath": "src/Reports/ОтчетПродажи/Templates/ПФ_MXL_Продажи"
+  }
+})
+```
+
+## Рабочий процесс
+
+Декомпиляция существующего макета для анализа или доработки:
+
+1. Ассистент вызывает MCP `unica.mxl.decompile` для получения JSON из Template.xml
+2. Ассистент при необходимости сохраняет JSON сам и анализирует или модифицирует его (добавляет области, меняет стили)
+3. Ассистент вызывает MCP `unica.mxl.compile` для генерации нового Template.xml
+4. Ассистент вызывает MCP `unica.mxl.validate` для проверки
+
+## JSON-схема DSL
+
+Полная спецификация формата: **`../../references/specs/mxl-dsl-spec.md`** (прочитать через Read tool).
+
+## Генерация имён
+
+Скрипт автоматически генерирует осмысленные имена:
+
+- **Шрифты**: `default`, `bold`, `header`, `small`, `italic` — или описательные имена по свойствам
+- **Стили**: `bordered`, `bordered-center`, `bold-right`, `border-top` и т.д. — по комбинации свойств
+
+## Детектирование `rowStyle`
+
+Если в строке есть пустые ячейки (без параметров/текста) и все они имеют одинаковый формат — этот формат распознаётся как `rowStyle`, а пустые ячейки исключаются из вывода.
+
+## Логический адрес вместо пути
+
+`unica.mxl.decompile` принимает либо логический селектор, либо файловый путь —
+ровно один из двух. Оба сразу отклоняются кодом `selector_conflict`.
+
+```js
+mcp({
+  tool: "unica.mxl.decompile",
+  args: {
+    "cwd": "<workspace>",
+    "sourceSet": "<имя набора>",
+    "metadataPath": "Report.<Отчёт>.Template.<Макет>"
+  }
+})
+```
+
+Имя набора даёт `unica.project.map`, адрес — `unica.source.resolve`, а `unica.source.locate` переводит
+в адрес путь, найденный иначе. Файловый селектор сохраняется до
+отдельного среза его снятия (ADR-0049).
