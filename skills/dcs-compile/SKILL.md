@@ -11,49 +11,102 @@ allowed-tools: bash read write find
 
 Все инструменты `unica.*` вызываются через прокси pi-mcp-adapter: `mcp({ tool: "unica.<tool>", args: { ... } })`; полный список — `mcp({ server: "unica" })`.
 
-- Preferred path: call `mcp({ tool: "unica.dcs.compile", args: { ... } })`; `unica` owns XML/JSON DSL work and refreshes related workspace caches after mutations.
-- Do not call internal MCP/CLI adapters directly. They are hidden behind `unica` and synchronized by the orchestrator.
-- Execution path: call MCP `unica` tool `unica.dcs.compile`; skill-local operation scripts are not part of the workflow.
-- For mutating operations, pass `dryRun: false` only when the user explicitly requested the change; otherwise keep the default dry run.
-- Vendor support guard runs inside `unica`; if it blocks a locked/read-only supported object, prefer CFE/release-support or an explicit support-state change plan instead of editing raw support metadata.
+- Preferred path: call `mcp({ tool: "unica.apply", args: { ... } })`; макет-схема заводится
+  операцией `template.add`, наполняется операциями СКД.
+- Не зови внутренние адаптеры напрямую: они спрятаны за MCP `unica`.
+- Сначала вызови `unica.apply` с `at` и `ops`: это план без записи.
+  Когда пользователь поручил внести эту правку, вызови `unica.apply` только
+  с `executionToken` из `data.executionToken` успешного плана.
 
-Принимает JSON-определение схемы компоновки данных → генерирует Template.xml (DataCompositionSchema).
+Новая схема компоновки собирается **двумя шагами**, а не одним вызовом из
+JSON-файла: сначала у объекта заводится макет вида `DataCompositionSchema`,
+затем он наполняется операциями словаря (`query.set`, `field.add`,
+`parameter.add`, `structure.set`, …) — их список и семантику держит `dcs-edit`.
 
-## MCP параметры
-
-| Параметр | Описание |
-|----------|----------|
-| `DefinitionFile` | Путь к JSON-файлу с определением СКД (взаимоисключающий с Value) |
-| `Value` | JSON-строка с определением СКД (взаимоисключающий с DefinitionFile) |
-| `OutputPath` | Путь к выходному Template.xml |
-
-### Из файла
+## Шаг 1 — завести макет
 
 ```js
 mcp({
-  tool: "unica.dcs.compile",
+  tool: "unica.apply",
   args: {
-    "cwd": "<workspace>",
-    "DefinitionFile": "<json>",
-    "OutputPath": "<Template.xml>",
-    "dryRun": false
+    "at": "main:Report.Продажи",
+    "ops": [
+      {
+        "op": "template.add",
+        "args": {
+          "items": [
+            {
+              "name": "ОсновнаяСхема",
+              "templateType": "DataCompositionSchema"
+            }
+          ]
+        }
+      }
+    ]
   }
 })
 ```
 
-### Из строки без промежуточного файла
+
+**Порядок важен.** Превью ничего не публикует, поэтому дочерний узел появится
+только после применения первого шага:
+
+1. превью `template.add` (`at` и `ops`) — план и `data.executionToken`;
+2. применение `template.add` (только `executionToken` из `data.executionToken` успешного плана) — макет создан;
+3. превью операций наполнения по адресу макета;
+4. применение их плана только с токеном из `data.executionToken` этого плана.
+
+Обратиться к адресу макета до шага 2 нельзя: план отказывает, потому что цели
+ещё нет.
+
+## Шаг 2 — наполнить
 
 ```js
 mcp({
-  tool: "unica.dcs.compile",
+  tool: "unica.apply",
   args: {
-    "cwd": "<workspace>",
-    "Value": "<json-string>",
-    "OutputPath": "<Template.xml>",
-    "dryRun": false
+    "at": "main:Report.Продажи.Template.ОсновнаяСхема",
+    "ops": [
+      {
+        "op": "query.set",
+        "args": {
+          "values": {
+            "query": "ВЫБРАТЬ Номенклатура, Сумма ИЗ РегистрНакопления.Продажи"
+          }
+        }
+      },
+      {
+        "op": "field.add",
+        "args": {
+          "items": [
+            {
+              "dataPath": "Номенклатура",
+              "title": "Товар"
+            }
+          ]
+        }
+      },
+      {
+        "op": "structure.set",
+        "args": {
+          "values": {
+            "structure": "Номенклатура > details"
+          }
+        }
+      }
+    ]
   }
 })
 ```
+
+## Чего словарь не пишет
+
+Сборки готового JSON-определения одним вызовом на поверхности **нет**: DSL
+ниже остаётся справочником формата, а не входом инструмента. Наборы данных и
+их связи, параметры данных варианта, условное оформление и параметры вывода
+операций тоже не имеют — полный перечень пробелов держит `dcs-edit`. Схема,
+которую нельзя собрать перечисленными операциями, — пробел контракта Unica
+MCP, а не повод писать XML руками.
 
 ## JSON DSL — краткий справочник
 
@@ -448,10 +501,9 @@ Raw XML (`"template": "<...>"`) остаётся как fallback. Детект: 
 
 ```js
 mcp({
-  tool: "unica.dcs.validate",
+  tool: "unica.check",
   args: {
-    "cwd": "<workspace>",
-    "TemplatePath": "<OutputPath>"
+    "at": "<sourceSet>:<Kind>.<Name>.Template.<Template>"
   }
 })
 ```
@@ -460,10 +512,10 @@ mcp({
 
 ```js
 mcp({
-  tool: "unica.dcs.info",
+  tool: "unica.view",
   args: {
     "cwd": "<workspace>",
-    "TemplatePath": "<OutputPath>"
+    "at": "<набор>:Report.<Отчёт>.Template.<Макет>"
   }
 })
 ```
@@ -472,10 +524,10 @@ mcp({
 
 ```js
 mcp({
-  tool: "unica.dcs.info",
+  tool: "unica.view",
   args: {
     "cwd": "<workspace>",
-    "TemplatePath": "<OutputPath>"
+    "at": "<набор>:Report.<Отчёт>.Template.<Макет>.Setting"
   }
 })
 ```

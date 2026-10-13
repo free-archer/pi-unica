@@ -26,6 +26,53 @@ const MCP_SERVER_NAME = "unica";
 
 const PACKAGE_ROOT = dirname(__dirname);
 
+/** Tool count of the pinned Unica surface, used when package.json is unreadable. */
+const TOOL_SURFACE_FALLBACK = 11;
+
+interface VersionInfo {
+  packageVersion: string | null;
+  unicaVersion: string | null;
+  toolSurface: number;
+  engines: string[];
+}
+
+function readJson(path: string): Record<string, unknown> | null {
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Which Unica this package is built on, read from the two places that record
+ * it: `package.json` (pin the maintainer edits) and
+ * `runtime/runtime-manifest.json` (written when the runtime is assembled).
+ */
+function readVersionInfo(target: string): VersionInfo {
+  const pkg = readJson(join(PACKAGE_ROOT, "package.json"));
+  const pinned = (pkg?.unica ?? {}) as Record<string, unknown>;
+  const runtime = readJson(join(PACKAGE_ROOT, "runtime", "runtime-manifest.json"));
+  const entry = ((runtime?.targets as Record<string, unknown> | undefined)?.[target] ?? {}) as {
+    engines?: Array<{ name?: string; version?: string }>;
+  };
+  return {
+    packageVersion: typeof pkg?.version === "string" ? pkg.version : null,
+    unicaVersion:
+      typeof runtime?.unicaVersion === "string"
+        ? runtime.unicaVersion
+        : typeof pinned.releaseTag === "string"
+          ? pinned.releaseTag
+          : null,
+    toolSurface:
+      typeof pinned.toolSurface === "number" ? pinned.toolSurface : TOOL_SURFACE_FALLBACK,
+    engines: (entry.engines ?? [])
+      .filter((e) => e.name && e.version)
+      .map((e) => `${e.name} ${e.version}`),
+  };
+}
+
 function detectTarget(): string | null {
   const os = platform();
   const a = arch();
@@ -140,6 +187,16 @@ function buildStatus(): StatusReport {
   }
   lines.push(`binary target: ${bin.target}`);
 
+  const info = readVersionInfo(bin.target);
+  if (info.packageVersion || info.unicaVersion) {
+    lines.push(
+      `version: pi-unica ${info.packageVersion ?? "unknown"} / unica ${info.unicaVersion ?? "unknown"}`,
+    );
+  }
+  if (info.engines.length > 0) {
+    lines.push(`engines: ${info.engines.join(", ")}`);
+  }
+
   if (existsSync(bin.path)) {
     try {
       accessSync(bin.path, constants.X_OK);
@@ -151,7 +208,7 @@ function buildStatus(): StatusReport {
   } else {
     ok = false;
     lines.push(`unica binary: MISSING (${bin.path})`);
-    lines.push("Run scripts/setup-backend.sh to build and download the runtime.");
+    lines.push("Run scripts/setup-backend.sh to download the pinned runtime.");
   }
 
   const manifest = join(PACKAGE_ROOT, "runtime", "third-party", "manifest.json");
@@ -206,9 +263,11 @@ export default function (pi: ExtensionAPI) {
 
       if (!existsSync(bin.path)) {
         if (ctx.hasUI) {
+          const info = readVersionInfo(bin.target);
           ctx.ui.notify?.(
             `${PACKAGE_NAME}: unica binary not found at ${bin.path}. ` +
-              "Run scripts/setup-backend.sh in the package to build and download the runtime.",
+              `Run scripts/setup-backend.sh in the package to download the pinned runtime ` +
+              `(unica ${info.unicaVersion ?? "unknown"}).`,
             "warning",
           );
         }
@@ -266,6 +325,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const status = buildStatus();
+      const info = bin ? readVersionInfo(bin.target) : null;
 
       // Check the mcp() proxy tool availability for the report.
       const tools = pi.getAllTools();
@@ -274,7 +334,7 @@ export default function (pi: ExtensionAPI) {
         ...status.lines,
         `  mcp() proxy tool: ${hasProxy ? "available" : "MISSING (install npm:pi-mcp-adapter, then /reload)"}`,
         hasProxy
-          ? '  verify: mcp({ server: "unica" }) → 74 tools'
+          ? `  verify: mcp({ server: "unica" }) → ${info?.toolSurface ?? TOOL_SURFACE_FALLBACK} tools`
           : "  verify after installing pi-mcp-adapter: mcp({ server: \"unica\" })",
       ];
 

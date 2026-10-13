@@ -12,12 +12,17 @@
  * The `sha256` is computed from the actual binary on disk, so the manifest
  * always reflects reality; a corrupt or missing binary produces an explicit
  * error rather than a silently wrong manifest.
+ *
+ * The pinned Unica version is recorded in the manifest (`unicaVersion`,
+ * `coreVersion`) alongside the per-tool versions the lock carries, so a
+ * runtime tree can always be traced back to the release it was assembled from.
  */
 
 import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { UNICA_VERSION, UNICA_CORE_VERSION } from "./lib/version.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = resolve(__dirname, "..");
@@ -48,9 +53,11 @@ function loadLock() {
 /**
  * Generate the manifest for a single target.
  * @param {string} target  target id: linux-x64 | darwin-arm64 | win-x64
+ * @param {string} [runtimeRoot]  runtime tree to inspect (defaults to the
+ *   package's own `runtime/`, override for a staging tree during packaging)
  * @returns {{ manifest: object, checks: Array<{name: string, sha256: string}> }}
  */
-export function generateManifest(target) {
+export function generateManifest(target, runtimeRoot = RUNTIME_ROOT) {
   const lock = loadLock();
   const cfg = lock.targets?.[target];
   if (!cfg) {
@@ -58,7 +65,7 @@ export function generateManifest(target) {
   }
   const exe = cfg.exe ?? "";
   const targetTriple = cfg.targetTriple;
-  const binDir = join(RUNTIME_ROOT, "bin", target);
+  const binDir = join(runtimeRoot, "bin", target);
 
   const tools = [];
   const checks = [];
@@ -69,7 +76,7 @@ export function generateManifest(target) {
     }
     const binaryName = tool.binaryName;
     const binaryPathRel = `bin/${target}/${binaryName}${exe}`;
-    const binaryPathAbs = join(RUNTIME_ROOT, binaryPathRel);
+    const binaryPathAbs = join(runtimeRoot, binaryPathRel);
     if (!existsSync(binaryPathAbs) || !statSync(binaryPathAbs).isFile()) {
       throw new Error(
         `binary missing for ${toolName}: ${binaryPathAbs}\n` +
@@ -96,6 +103,9 @@ export function generateManifest(target) {
     generatedBy: "pi-unica scripts/generate-manifest.mjs",
     sourceLock: "third-party/tools.lock.json",
     target,
+    targetTriple,
+    unicaVersion: UNICA_VERSION,
+    coreVersion: UNICA_CORE_VERSION,
     tools,
   };
 

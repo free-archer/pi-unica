@@ -2,20 +2,26 @@
 /**
  * pi-unica backend setup.
  *
- * Produces a complete `runtime/` tree and registers the `unica` MCP server in
- * pi's agent-level MCP config so that pi-mcp-adapter can proxy `unica.*` tools.
+ * Produces a complete `runtime/` tree for the current host and registers the
+ * `unica` MCP server in pi's agent-level MCP config so that pi-mcp-adapter can
+ * proxy the `unica.*` tools.
  *
  * Layout produced (mirrors the upstream Unica runtime):
  *   runtime/
- *     bin/<target>/unica                 # built from vendored source (cargo)
+ *     bin/<target>/unica                 # pinned release binary (default)
  *     bin/<target>/bsl-analyzer          # downloaded, SHA-256 verified
  *     bin/<target>/v8-runner             # downloaded, SHA-256 verified
  *     bin/<target>/rlm-bsl-mcp           # extracted, archive SHA-256 verified
  *     bin/<target>/rlm-bsl-index         # extracted, archive SHA-256 verified
  *     third-party/manifest.json          # generated (binary SHA-256, target triple)
  *     third-party/tools.lock.json        # copied from vendored upstream
+ *     runtime-manifest.json              # pinned Unica version + engine versions
  *     skills/                            # marker dir (plugin-root discovery)
  *     .mcp.json                          # marker file (plugin-root discovery)
+ *
+ * Since Unica 0.13 the published core archive is thin — it carries only the
+ * `unica` binary and a manifest — so the engines are acquired separately from
+ * the addresses pinned in the vendored `third-party/tools.lock.json`.
  *
  * The `unica` binary discovers its plugin root by walking ancestors of its own
  * executable looking for `skills/` + `.mcp.json` or `third-party/manifest.json`
@@ -23,21 +29,43 @@
  *
  * Options:
  *   --target <id>            linux-x64 | darwin-arm64 | win-x64 (default: detect)
- *   --skip-build             do not run cargo build (unica binary must already exist)
- *   --skip-download          do not download third-party binaries
+ *   --version <tag>          Unica release tag (default: the pinned version)
+ *   --build-local            build `unica` from the vendored source with cargo
+ *                            instead of taking the pinned release binary
+ *   --skip-core              do not install the `unica` binary
+ *   --skip-engines           do not download the third-party engines
+ *                            (aliases: --skip-build, --skip-download)
+ *   --skip-manifest          do not regenerate third-party/manifest.json
  *   --skip-mcp-config        do not write ~/.pi/agent/mcp.json
- *   --from-runtime-url <url> fallback: install from an official
- *                            unica-runtime-<target>.tar.gz release asset
+ *   --force                  reinstall bin/<target> even when the recorded
+ *                            version already matches the pinned one
+ *   --from-runtime-url <url> take the core from this archive instead of the
+ *                            pinned release asset
+ *   --keep-build-cache       keep runtime/.downloads and runtime/.cargo-target
  *   --dry-run                print the plan without performing heavy work
  */
 
-import { existsSync, mkdirSync, copyFileSync, chmodSync, readFileSync, writeFileSync, rmSync, readdirSync, statSync } from "node:fs";
-import { createHash } from "node:crypto";
-import { join, dirname, resolve, basename } from "node:path";
+import { existsSync, mkdirSync, copyFileSync, chmodSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { homedir, platform, arch, tmpdir } from "node:os";
-import { spawnSync } from "node:child_process";
+import { homedir, platform, arch } from "node:os";
 import { generateManifest } from "./generate-manifest.mjs";
+import {
+  TARGET_TRIPLES,
+  buildRuntimeManifestEntry,
+  download,
+  extractArchive,
+  ensureDir,
+  exeSuffix,
+  fetchUnicaCore,
+  installThirdParty,
+  loadLock,
+  log,
+  buildUnicaLocal,
+  sha256File,
+  writeRuntimeManifest,
+} from "./lib/toolchain.mjs";
+import { UNICA_VERSION, UNICA_CORE_VERSION, UNICA_RELEASE_REPO } from "./lib/version.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = resolve(__dirname, "..");
@@ -45,26 +73,8 @@ const UNICA_ROOT = join(PACKAGE_ROOT, "unica");
 const LOCK_PATH = join(UNICA_ROOT, "plugins", "unica", "third-party", "tools.lock.json");
 const RUNTIME_ROOT = join(PACKAGE_ROOT, "runtime");
 const MANIFEST_PATH = join(RUNTIME_ROOT, "third-party", "manifest.json");
+const RUNTIME_MANIFEST_PATH = join(RUNTIME_ROOT, "runtime-manifest.json");
 const MCP_SERVER_NAME = "unica";
-
-const THIRD_PARTY_TOOLS = ["bsl-analyzer", "v8-runner", "rlm-bsl-mcp", "rlm-bsl-index"];
-const TARGET_TRIPLES = {
-  "linux-x64": "x86_64-unknown-linux-gnu",
-  "darwin-arm64": "aarch64-apple-darwin",
-  "win-x64": "x86_64-pc-windows-msvc",
-};
-
-function sha256File(path) {
-  const hash = createHash("sha256");
-  hash.update(readFileSync(path));
-  return hash.digest("hex");
-}
-
-function loadLock() {
-  const lock = JSON.parse(readFileSync(LOCK_PATH, "utf-8"));
-  if (lock.schemaVersion !== 1) throw new Error(`unsupported tools.lock.json schemaVersion: ${lock.schemaVersion}`);
-  return lock;
-}
 
 function detectTarget() {
   const os = platform();
@@ -75,168 +85,49 @@ function detectTarget() {
   throw new Error(`unsupported host: ${os}/${a}`);
 }
 
-function log(step, message) {
-  console.log(`[${step}] ${message}`);
-}
-
-function run(command, args, options = {}) {
-  const result = spawnSync(command, args, { stdio: "inherit", ...options });
-  if (result.status !== 0) {
-    throw new Error(`${command} ${args.join(" ")} exited with ${result.status}`);
+/** Fail loudly on a half-done version bump (package.json vs scripts/lib/version.mjs). */
+function assertVersionsAgree() {
+  const packageJson = JSON.parse(readFileSync(join(PACKAGE_ROOT, "package.json"), "utf-8"));
+  if (packageJson.version !== UNICA_CORE_VERSION) {
+    throw new Error(
+      `version mismatch: package.json says ${packageJson.version}, ` +
+        `scripts/lib/version.mjs pins ${UNICA_CORE_VERSION}`,
+    );
   }
 }
 
-function ensureDir(path) {
-  mkdirSync(path, { recursive: true });
-}
-
-function releaseAssetUrl(tool, asset) {
-  const repository = tool.assetRepository || tool.repository;
-  const tag = tool.assetTag || tool.sourceTag;
-  return `${repository}/releases/download/${tag}/${asset.assetName}`;
-}
-
-async function download(url, dest) {
-  log("download", url);
-  const response = await fetch(url, { redirect: "follow" });
-  if (!response.ok) {
-    throw new Error(`download failed (${response.status}): ${url}`);
-  }
-  const buffer = Buffer.from(await response.arrayBuffer());
-  mkdirSync(dirname(dest), { recursive: true });
-  writeFileSync(dest, buffer);
-  return buffer.length;
-}
-
-function findFile(root, name) {
-  const stack = [root];
-  while (stack.length) {
-    const dir = stack.pop();
-    for (const entry of readdirSync(dir)) {
-      const full = join(dir, entry);
-      const st = statSync(full);
-      if (st.isDirectory()) stack.push(full);
-      else if (entry === name) return full;
-    }
-  }
-  return null;
-}
-
-function buildUnica(target, dryRun) {
-  const exe = target === "win-x64" ? ".exe" : "";
-  const dest = join(RUNTIME_ROOT, "bin", target, `unica${exe}`);
-  if (existsSync(dest)) {
-    log("build", `unica binary already present: ${dest} (use --skip-build or delete to rebuild)`);
-    return dest;
-  }
-  if (dryRun) {
-    log("build", `[dry-run] would run: cargo build --release --locked -p unica-coder --bin unica`);
-    return dest;
-  }
-  const targetDir = join(RUNTIME_ROOT, ".cargo-target");
-  log("build", "cargo build --release --locked -p unica-coder --bin unica");
-  run("cargo", ["build", "--release", "--locked", "-p", "unica-coder", "--bin", "unica", "--target-dir", targetDir], {
-    cwd: UNICA_ROOT,
-  });
-  const produced = join(targetDir, "release", `unica${exe}`);
-  if (!existsSync(produced)) throw new Error(`cargo build output not found: ${produced}`);
-  ensureDir(dirname(dest));
-  copyFileSync(produced, dest);
-  if (exe === "") chmodSync(dest, 0o755);
-  log("build", `built ${dest}`);
-  return dest;
-}
-
-async function downloadThirdParty(target, lock, dryRun) {
-  const cfg = lock.targets[target];
-  const exe = cfg.exe ?? "";
-  const binDir = join(RUNTIME_ROOT, "bin", target);
-  ensureDir(binDir);
-  const workDir = join(RUNTIME_ROOT, ".downloads", target);
-  ensureDir(workDir);
-
-  const byName = new Map(lock.tools.map((t) => [t.name, t]));
-  const archiveGroups = new Map(); // assetName -> { tool, asset, tools: [] }
-
-  for (const toolName of THIRD_PARTY_TOOLS) {
-    const tool = byName.get(toolName);
-    if (!tool) throw new Error(`tools.lock.json missing tool ${toolName}`);
-    const asset = tool.assets?.[target];
-    if (!asset) throw new Error(`${toolName} has no asset for ${target}`);
-    if (tool.assetStrategy === "direct-release-asset") {
-      const dest = join(binDir, `${tool.binaryName}${exe}`);
-      if (existsSync(dest)) {
-        log("download", `${toolName} already present: ${dest}`);
-        continue;
-      }
-      if (dryRun) {
-        log("download", `[dry-run] would fetch ${releaseAssetUrl(tool, asset)}`);
-        continue;
-      }
-      const tmp = join(workDir, asset.assetName);
-      await download(releaseAssetUrl(tool, asset), tmp);
-      const actual = sha256File(tmp);
-      if (actual !== asset.sha256) {
-        throw new Error(`${toolName} checksum mismatch: expected ${asset.sha256}, got ${actual}`);
-      }
-      copyFileSync(tmp, dest);
-      chmodSync(dest, 0o755);
-      log("download", `${toolName} verified (sha256 ok)`);
-    } else if (tool.assetStrategy === "archive-release-asset") {
-      const key = asset.assetName;
-      if (!archiveGroups.has(key)) archiveGroups.set(key, { tool, asset, tools: [] });
-      archiveGroups.get(key).tools.push(tool);
-    } else {
-      throw new Error(`unsupported assetStrategy for ${toolName}: ${tool.assetStrategy}`);
-    }
-  }
-
-  for (const { tool, asset, tools } of archiveGroups.values()) {
-    const archiveFile = join(workDir, asset.assetName);
-    const allPresent = tools.every((t) => existsSync(join(binDir, `${t.binaryName}${exe}`)));
-    if (allPresent) {
-      log("download", `${tools.map((t) => t.name).join(", ")} already present`);
-      continue;
-    }
-    if (dryRun) {
-      log("download", `[dry-run] would fetch ${releaseAssetUrl(tool, asset)} and extract ${tools.map((t) => t.assets[target].archiveBinary).join(", ")}`);
-      continue;
-    }
-    await download(releaseAssetUrl(tool, asset), archiveFile);
-    const actual = sha256File(archiveFile);
-    if (actual !== asset.sha256) {
-      throw new Error(`${asset.assetName} checksum mismatch: expected ${asset.sha256}, got ${actual}`);
-    }
-    const extractDir = join(workDir, "extract", basename(asset.assetName, ".tar.gz"));
-    rmSync(extractDir, { recursive: true, force: true });
-    ensureDir(extractDir);
-    run("tar", ["-xzf", archiveFile, "-C", extractDir]);
-    for (const t of tools) {
-      const archiveBinary = t.assets[target].archiveBinary;
-      const found = findFile(extractDir, archiveBinary);
-      if (!found) throw new Error(`archive ${asset.assetName} does not contain ${archiveBinary}`);
-      const dest = join(binDir, `${t.binaryName}${exe}`);
-      copyFileSync(found, dest);
-      chmodSync(dest, 0o755);
-      log("download", `${t.name} extracted from ${asset.assetName}`);
-    }
-  }
-}
-
-function writeMarkers(target) {
+function writeMarkers() {
   ensureDir(join(RUNTIME_ROOT, "skills"));
   const mcpMarker = join(RUNTIME_ROOT, ".mcp.json");
   if (!existsSync(mcpMarker)) {
-    writeFileSync(mcpMarker, JSON.stringify({
-      mcpServers: {
-        unica: { command: "unica", args: [] },
-      },
-    }, null, 2) + "\n", "utf-8");
+    writeFileSync(
+      mcpMarker,
+      JSON.stringify({ mcpServers: { unica: { command: "unica", args: [] } } }, null, 2) + "\n",
+      "utf-8",
+    );
   }
-  // tools.lock.json lives next to the manifest for bundled-tool dry-run fallback.
+  // tools.lock.json lives next to the manifest for the bundled-tool dry-run
+  // fallback and for version lookups performed by the unica binary.
   const lockDest = join(RUNTIME_ROOT, "third-party", "tools.lock.json");
   ensureDir(dirname(lockDest));
   copyFileSync(LOCK_PATH, lockDest);
+}
+
+/**
+ * Record the pinned versions inside the plugin runtime tree. This file is what
+ * answers "which Unica is this plugin built on?" without asking a binary or a
+ * running server.
+ */
+function recordVersions({ target, core, engines, origin }) {
+  const entry = buildRuntimeManifestEntry({ target, core, engines, origin });
+  const { manifest } = writeRuntimeManifest(RUNTIME_ROOT, {
+    generatedBy: "pi-unica scripts/setup-backend.mjs",
+    targets: { [target]: entry },
+  });
+  log(
+    "version",
+    `runtime-manifest.json: unica ${UNICA_VERSION} core + ${manifest.targets[target].engines.length} engines`,
+  );
 }
 
 function getPiAgentMcpConfigPath() {
@@ -246,8 +137,7 @@ function getPiAgentMcpConfigPath() {
 }
 
 function writeMcpConfig(target, dryRun) {
-  const exe = target === "win-x64" ? ".exe" : "";
-  const command = join(RUNTIME_ROOT, "bin", target, `unica${exe}`);
+  const command = join(RUNTIME_ROOT, "bin", target, `unica${exeSuffix(target)}`);
   const configPath = getPiAgentMcpConfigPath();
 
   if (dryRun) {
@@ -263,9 +153,10 @@ function writeMcpConfig(target, dryRun) {
       throw new Error(`failed to read existing MCP config ${configPath}: ${error.message}`);
     }
   }
-  const servers = config.mcpServers && typeof config.mcpServers === "object" && !Array.isArray(config.mcpServers)
-    ? config.mcpServers
-    : {};
+  const servers =
+    config.mcpServers && typeof config.mcpServers === "object" && !Array.isArray(config.mcpServers)
+      ? config.mcpServers
+      : {};
   const existing = servers[MCP_SERVER_NAME];
   if (existing && existing.command === command && (existing.args ?? []).length === 0) {
     log("mcp", `entry already matches in ${configPath}`);
@@ -277,85 +168,180 @@ function writeMcpConfig(target, dryRun) {
   log("mcp", `wrote "${MCP_SERVER_NAME}" -> ${command} in ${configPath}`);
 }
 
-async function installFromRuntimeUrl(url, target, lock) {
-  const exe = target === "win-x64" ? ".exe" : "";
-  const archiveFile = join(RUNTIME_ROOT, ".downloads", `unica-runtime-${target}.tar.gz`);
-  await download(url, archiveFile);
-  const extractDir = join(RUNTIME_ROOT, ".downloads", `unica-runtime-${target}-extract`);
-  rmSync(extractDir, { recursive: true, force: true });
-  ensureDir(extractDir);
-  run("tar", ["-xzf", archiveFile, "-C", extractDir]);
-
-  // The official archive may wrap content in a single top-level directory.
-  let contentRoot = extractDir;
-  const entries = readdirSync(extractDir).filter((e) => statSync(join(extractDir, e)).isDirectory());
-  if (entries.length === 1) contentRoot = join(extractDir, entries[0]);
-
-  const binSrc = join(contentRoot, "bin", target);
-  if (!existsSync(binSrc)) throw new Error(`runtime archive has no bin/${target} directory`);
-  const binDest = join(RUNTIME_ROOT, "bin", target);
-  ensureDir(binDest);
-  for (const entry of readdirSync(binSrc)) {
-    copyFileSync(join(binSrc, entry), join(binDest, entry));
-    if (!entry.endsWith(".exe")) chmodSync(join(binDest, entry), 0o755);
+/** Install the core from an explicit archive URL (kept for pinned mirrors). */
+async function installCoreFromUrl(url, target, binDir, cacheDir) {
+  const archive = join(cacheDir, `unica-runtime-${target}.tar.gz`);
+  await download(url, archive);
+  const extractDir = join(cacheDir, `unica-runtime-${target}-extract`);
+  extractArchive(archive, extractDir);
+  const source = join(extractDir, "bin", target, `unica${exeSuffix(target)}`);
+  if (!existsSync(source)) {
+    throw new Error(`core archive has no bin/${target}/unica${exeSuffix(target)}: ${url}`);
   }
-  // Prefer the archive's own third-party manifest if present.
-  const manifestSrc = join(contentRoot, "third-party", "manifest.json");
-  if (existsSync(manifestSrc)) {
-    ensureDir(join(RUNTIME_ROOT, "third-party"));
-    copyFileSync(manifestSrc, join(RUNTIME_ROOT, "third-party", "manifest.json"));
-  }
-  // Copy the lock and markers regardless.
-  writeMarkers(target);
-  log("install", `installed runtime from ${url}`);
+  const dest = join(binDir, `unica${exeSuffix(target)}`);
+  ensureDir(binDir);
+  copyFileSync(source, dest);
+  chmodSync(dest, 0o755);
+  log("core", `installed ${dest} from ${url}`);
+  return dest;
 }
 
-async function main() {
-  const args = process.argv.slice(2);
+/**
+ * The Unica version the current `runtime/` was assembled for, or null when it
+ * predates version recording. Used to reinstall instead of silently keeping
+ * binaries of an older release.
+ */
+function runtimeAssembledVersion() {
+  if (!existsSync(RUNTIME_MANIFEST_PATH)) return null;
+  try {
+    const manifest = JSON.parse(readFileSync(RUNTIME_MANIFEST_PATH, "utf-8"));
+    return manifest.unicaVersion ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function parseArgs(argv) {
+  const args = argv.slice(2);
   const flag = (name) => args.includes(name);
   const value = (name) => {
     const i = args.indexOf(name);
     return i >= 0 ? args[i + 1] : undefined;
   };
-  const target = value("--target") ?? detectTarget();
-  if (!TARGET_TRIPLES[target]) throw new Error(`unknown target: ${target}`);
-  const dryRun = flag("--dry-run");
+  return {
+    target: value("--target") ?? detectTarget(),
+    version: value("--version") ?? UNICA_VERSION,
+    buildLocal: flag("--build-local"),
+    force: flag("--force"),
+    skipCore: flag("--skip-core") || flag("--skip-build"),
+    skipEngines: flag("--skip-engines") || flag("--skip-download"),
+    skipManifest: flag("--skip-manifest"),
+    skipMcpConfig: flag("--skip-mcp-config"),
+    keepBuildCache: flag("--keep-build-cache"),
+    coreUrl: value("--from-runtime-url"),
+    dryRun: flag("--dry-run"),
+  };
+}
 
-  log("setup", `pi-unica backend — target ${target} (${TARGET_TRIPLES[target]})`);
+async function main() {
+  const opts = parseArgs(process.argv);
+  const { target } = opts;
+  if (!TARGET_TRIPLES[target]) throw new Error(`unknown target: ${target}`);
+  assertVersionsAgree();
+
+  log("setup", `pi-unica ${UNICA_CORE_VERSION} backend — target ${target} (${TARGET_TRIPLES[target]})`);
   ensureDir(RUNTIME_ROOT);
 
   if (!existsSync(LOCK_PATH)) throw new Error(`tools.lock.json not found: ${LOCK_PATH}`);
-  const lock = loadLock();
+  const { lock } = loadLock(UNICA_ROOT);
 
-  const runtimeUrl = value("--from-runtime-url");
-  if (runtimeUrl) {
-    if (dryRun) log("install", `[dry-run] would install from ${runtimeUrl}`);
-    else await installFromRuntimeUrl(runtimeUrl, target, lock);
-  } else {
-    if (!flag("--skip-build")) buildUnica(target, dryRun);
-    if (!flag("--skip-download")) await downloadThirdParty(target, lock, dryRun);
-    writeMarkers(target);
+  const binDir = join(RUNTIME_ROOT, "bin", target);
+  const cacheDir = join(RUNTIME_ROOT, ".downloads", target);
+
+  // A runtime tree from another Unica release must not be reused in place:
+  // the engines and the core change together, and half of each is worse than
+  // neither. Version is read from the tree's own runtime-manifest.json.
+  const previousVersion = runtimeAssembledVersion();
+  const hasCore = existsSync(join(binDir, `unica${exeSuffix(target)}`));
+  const stale =
+    opts.force ||
+    (previousVersion !== null && previousVersion !== UNICA_VERSION) ||
+    (previousVersion === null && hasCore);
+  if (stale) {
+    if (opts.skipCore || opts.skipEngines) {
+      throw new Error(
+        `runtime/ holds unica ${previousVersion ?? "of unknown version"}, ` +
+          `this package pins ${UNICA_VERSION}; drop --skip-core/--skip-engines to reinstall`,
+      );
+    }
+    if (opts.dryRun) {
+      log("setup", `[dry-run] would reinstall bin/${target} (was unica ${previousVersion ?? "unknown"})`);
+    } else {
+      rmSync(binDir, { recursive: true, force: true });
+      log(
+        "setup",
+        `reinstalling bin/${target}: was unica ${previousVersion ?? "unknown (pre-0.13 tree)"}, ` +
+          `now ${UNICA_VERSION}`,
+      );
+    }
   }
 
-  const keepCache = flag("--keep-build-cache");
-  if (!dryRun && !keepCache) {
+  let core = { sha256: null };
+  let origin = "release";
+  if (!opts.skipCore) {
+    if (opts.buildLocal && target !== detectTarget()) {
+      throw new Error(
+        `--build-local can only build the host target (${detectTarget()}), not ${target}`,
+      );
+    }
+    if (opts.buildLocal && opts.dryRun) {
+      log("build", "[dry-run] would run: cargo build --release --locked -p unica-coder --bin unica");
+      origin = "local-build";
+    } else if (opts.buildLocal) {
+      origin = "local-build";
+      const dest = buildUnicaLocal({
+        unicaRoot: UNICA_ROOT,
+        binDir,
+        target,
+        targetDir: join(RUNTIME_ROOT, ".cargo-target"),
+      });
+      core = { sha256: sha256File(dest), meta: null };
+    } else if (opts.coreUrl) {
+      origin = "url";
+      if (opts.dryRun) {
+        log("core", `[dry-run] would install the core from ${opts.coreUrl}`);
+      } else {
+        const dest = await installCoreFromUrl(opts.coreUrl, target, binDir, cacheDir);
+        core = { sha256: sha256File(dest), meta: null };
+      }
+    } else {
+      core = await fetchUnicaCore({
+        target,
+        version: opts.version,
+        coreVersion: opts.version === UNICA_VERSION ? UNICA_CORE_VERSION : undefined,
+        binDir,
+        cacheDir,
+        dryRun: opts.dryRun,
+        ignoreExisting: stale,
+      });
+    }
+  } else {
+    log("core", "skipped (--skip-core)");
+  }
+
+  let engines = [];
+  if (!opts.skipEngines) {
+    engines = await installThirdParty({
+      target,
+      lock,
+      binDir,
+      cacheDir,
+      dryRun: opts.dryRun,
+      ignoreExisting: stale,
+    });
+  } else {
+    log("engine", "skipped (--skip-engines)");
+  }
+
+  writeMarkers();
+
+  if (!opts.dryRun && !opts.keepBuildCache) {
     rmSync(join(RUNTIME_ROOT, ".cargo-target"), { recursive: true, force: true });
     rmSync(join(RUNTIME_ROOT, ".downloads"), { recursive: true, force: true });
   }
 
-  if (!dryRun && !flag("--skip-manifest")) {
-    if (flag("--skip-download")) {
-      log("manifest", "skipped (--skip-download); run 'node scripts/generate-manifest.mjs " + target + "' after binaries are present");
-    } else {
-      const { manifest, checks } = generateManifest(target);
-      mkdirSync(dirname(MANIFEST_PATH), { recursive: true });
-      writeFileSync(MANIFEST_PATH, JSON.stringify(manifest, null, 2) + "\n", "utf-8");
-      for (const c of checks) log("manifest", `${c.name.padEnd(16)} ${c.sha256}  ${c.binaryPath}`);
-      log("manifest", `written ${MANIFEST_PATH}`);
-    }
+  if (!opts.dryRun && !opts.skipManifest) {
+    const { manifest, checks } = generateManifest(target);
+    ensureDir(dirname(MANIFEST_PATH));
+    writeFileSync(MANIFEST_PATH, JSON.stringify(manifest, null, 2) + "\n", "utf-8");
+    for (const c of checks) log("manifest", `${c.name.padEnd(16)} ${c.sha256}  ${c.binaryPath}`);
+    log("manifest", `written ${MANIFEST_PATH}`);
+    recordVersions({ target, core, engines, origin });
+  } else if (opts.dryRun) {
+    log("manifest", "[dry-run] would write third-party/manifest.json and runtime-manifest.json");
   }
 
-  if (!flag("--skip-mcp-config")) writeMcpConfig(target, dryRun);
+  if (!opts.skipMcpConfig) writeMcpConfig(target, opts.dryRun);
 
   log("setup", "done. Run /reload in pi, then verify with mcp({ server: \"unica\" }).");
 }

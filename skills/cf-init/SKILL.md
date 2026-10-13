@@ -11,85 +11,63 @@ allowed-tools: bash read find
 
 Все инструменты `unica.*` вызываются через прокси pi-mcp-adapter: `mcp({ tool: "unica.<tool>", args: { ... } })`; полный список — `mcp({ server: "unica" })`.
 
-- Preferred path: call `mcp({ tool: "unica.cf.init", args: { ... } })`; `unica` owns XML/JSON DSL work and refreshes related workspace caches after mutations.
-- Do not call internal MCP/CLI adapters directly. They are hidden behind `unica` and synchronized by the orchestrator.
-- Execution path: call MCP `unica` tool `unica.cf.init`; skill-local operation scripts are not part of the workflow.
-- For mutating operations, pass `dryRun: false` only when the user explicitly requested the change; otherwise keep the default dry run.
+- **Канонической операции создания конфигурации на поверхности нет.** Словарь
+  `unica.apply` правит существующий узел: `object.create` заводит объект
+  метаданных **внутри** конфигурации, но самого корня `Configuration.xml` не
+  создаёт.
+- Не зови внутренние адаптеры напрямую: они спрятаны за MCP `unica`.
+- Готовность проверяет `unica.check`, результат читает `unica.view` по адресу.
 
-Создаёт scaffold исходников пустой конфигурации 1С: `Configuration.xml`, `Languages/Русский.xml`.
+Поэтому корень новой конфигурации формируется файловыми средствами по формату
+ниже — тем же порядком, каким заводится `v8project.yaml`
+(`DEC.2026-09-09.PROJECT-CONFIG-IS-HANDWRITTEN`):
 
-## MCP параметры
+1. записать `Configuration.xml` и обязательные `Ext/`;
+2. объявить набор в `v8project.yaml` и убедиться в допуске: `unica.check {}`;
+3. прочитать корень: `unica.view {at: "<набор>:Configuration"}`;
+4. дальше объекты заводит `unica.apply` (`object.create`, `props.set`).
 
-| Параметр | Описание |
-|----------|----------|
-| `Name` | Имя конфигурации (обязат.) |
-| `Synonym` | Синоним (= Name если не указан) |
-| `OutputDir` | Каталог для создания (default: `src`) |
-| `Version` | Версия конфигурации |
-| `Vendor` | Поставщик |
-| `CompatibilityMode` | Режим совместимости (default: `Version8_3_27`) |
-
-```js
-mcp({
-  tool: "unica.cf.init",
-  args: {
-    "cwd": "<workspace>",
-    "Name": "DemoConfiguration",
-    "Synonym": "Демо конфигурация",
-    "OutputDir": "src",
-    "Vendor": "Ingvar Consulting",
-    "dryRun": false
-  }
-})
-```
+Если нужна именно операция создания корня — это пробел контракта Unica MCP;
+сообщи о нём, а не подменяй его правкой чужой конфигурации.
 
 ## Примеры
 
 ### Базовая конфигурация
 
-```js
-mcp({
-  tool: "unica.cf.init",
-  args: {
-    "cwd": "<workspace>",
-    "Name": "МояКонфигурация",
-    "Synonym": "Моя конфигурация",
-    "OutputDir": "test-tmp/cf",
-    "dryRun": false
-  }
-})
+Поля, которые должен нести записанный файл:
+
+```json
+{
+  "Name": "МояКонфигурация",
+  "Synonym": "Моя конфигурация",
+  "OutputDir": "test-tmp/cf"
+}
 ```
 
 ### С версией и поставщиком
 
-```js
-mcp({
-  tool: "unica.cf.init",
-  args: {
-    "cwd": "<workspace>",
-    "Name": "TestCfg",
-    "Synonym": "Тестовая",
-    "Version": "1.0.0.1",
-    "Vendor": "Фирма 1С",
-    "OutputDir": "test-tmp/cf2",
-    "dryRun": false
-  }
-})
+Поля, которые должен нести записанный файл:
+
+```json
+{
+  "Name": "TestCfg",
+  "Synonym": "Тестовая",
+  "Version": "1.0.0.1",
+  "Vendor": "Фирма 1С",
+  "OutputDir": "test-tmp/cf2"
+}
 ```
 
 ### Другой режим совместимости
 
-```js
-mcp({
-  tool: "unica.cf.init",
-  args: {
-    "cwd": "<workspace>",
-    "Name": "TestCfg",
-    "CompatibilityMode": "Version8_3_27",
-    "OutputDir": "test-tmp/cf3",
-    "dryRun": false
-  }
-})
+Поля, которые должен нести записанный файл:
+
+```json
+{
+  "Name": "TestCfg",
+  "CompatibilityMode": "Version8_3_27",
+  "OutputDir": "test-tmp/cf3"
+}
 ```
 
 ## Верификация
@@ -100,10 +78,9 @@ mcp({
 
 ```js
 mcp({
-  tool: "unica.cf.info",
+  tool: "unica.view",
   args: {
-    "cwd": "<workspace>",
-    "ConfigPath": "test-tmp/cf"
+    "at": "main:Configuration"
   }
 })
 ```
@@ -112,10 +89,9 @@ mcp({
 
 ```js
 mcp({
-  tool: "unica.cf.validate",
+  tool: "unica.check",
   args: {
-    "cwd": "<workspace>",
-    "ConfigPath": "test-tmp/cf"
+    "at": "<sourceSet>:Configuration"
   }
 })
 ```

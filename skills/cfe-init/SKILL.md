@@ -11,131 +11,87 @@ allowed-tools: bash read find
 
 Все инструменты `unica.*` вызываются через прокси pi-mcp-adapter: `mcp({ tool: "unica.<tool>", args: { ... } })`; полный список — `mcp({ server: "unica" })`.
 
-- Preferred path: call `mcp({ tool: "unica.cfe.init", args: { ... } })`; `unica` owns XML/JSON DSL work and refreshes related workspace caches after mutations.
-- Do not call internal MCP/CLI adapters directly. They are hidden behind `unica` and synchronized by the orchestrator.
-- Execution path: call MCP `unica` tool `unica.cfe.init`; skill-local operation scripts are not part of the workflow.
-- For mutating operations, pass `dryRun: false` only when the user explicitly requested the change; otherwise keep the default dry run.
+- **Канонической операции создания расширения на поверхности нет.** Словарь
+  `unica.apply` правит существующий узел; корень расширения с его
+  `NamePrefix`, `ConfigurationExtensionPurpose` и связью с родителем ни одна
+  операция не заводит.
+- Не зови внутренние адаптеры напрямую: они спрятаны за MCP `unica`.
+- Готовность проверяет `unica.check`, результат читает `unica.view` по адресу.
 
-Создаёт scaffold расширения: `Configuration.xml`, `Languages/Русский.xml`, опционально `Roles/`.
+Порядок тот же, что у новой конфигурации: сформировать корень расширения
+файловыми средствами по формату ниже, объявить набор вида `EXTENSION` в
+`v8project.yaml`, проверить `unica.check {}` и прочитать
+`unica.view {at: "<расширение>:Configuration"}`.
 
-## Подготовка
+Заимствование объектов у родителя — отдельный предмет: канонической операции
+тоже нет, разбор и план держит отдельная архитектурная записка Unica.
 
-Если есть выгрузка базовой конфигурации, передай `-ConfigPath` — скрипт автоматически определит `CompatibilityMode` и UUID языка из базовой конфигурации.
-
-### Авто-определение ConfigPath
-
-Если пользователь не указал `-ConfigPath` — попробуй определить автоматически:
-1. Используй `./v8project.yaml`.
-2. Найди `source-set` с `type: CONFIGURATION`.
-3. Используй его `path` как `-ConfigPath`.
-4. Если source-set не найден — спроси путь у пользователя.
-
-Если `v8project.yaml` не найден и `-ConfigPath` не задан — расширение создастся с предупреждением (UUID языка = нули, CompatibilityMode по умолчанию).
-
-## Параметры
-
-| Параметр | Описание | По умолчанию |
-|----------|----------|--------------|
-| `Name` | Имя расширения (обязат.) | — |
-| `Synonym` | Синоним | = Name |
-| `NamePrefix` | Префикс собственных объектов | = Name + "_" |
-| `OutputDir` | Каталог для создания | `src` |
-| `Purpose` | `Patch` (исправление) / `Customization` (доработка) / `AddOn` (дополнение) | `Customization` |
-| `Version` | Версия расширения | — |
-| `Vendor` | Поставщик | — |
-| `CompatibilityMode` | Режим совместимости | `Version8_3_24` |
-| `ConfigPath` | Путь к выгрузке базовой конфигурации (авто-определяет CompatibilityMode и Language UUID) | — |
-| `NoRole` | Без основной роли | false |
-
-## MCP вызов
-
-```js
-mcp({
-  tool: "unica.cfe.init",
-  args: {
-    "cwd": "<workspace>",
-    "Name": "MyExtension",
-    "Synonym": "Моё расширение",
-    "OutputDir": "src/extensions/MyExtension",
-    "dryRun": false
-  }
-})
-```
+Если нужна именно операция создания расширения — это пробел контракта Unica
+MCP; сообщи о нём, а не подменяй его правкой родительской конфигурации.
 
 ## Примеры
 
 ### Расширение для ERP с авто-совместимостью
 
-```js
-mcp({
-  tool: "unica.cfe.init",
-  args: {
-    "cwd": "<workspace>",
-    "Name": "Расш1",
-    "ConfigPath": "C:\\WS\\tasks\\cfsrc\\erp_8.3.24",
-    "OutputDir": "src",
-    "dryRun": false
-  }
-})
+Поля, которые должен нести записанный файл:
+
+```json
+{
+  "Name": "Расш1",
+  "ConfigPath": "C:\\WS\\tasks\\cfsrc\\erp_8.3.24",
+  "OutputDir": "src"
+}
 ```
 
 ### Расширение-исправление с явной совместимостью
 
-```js
-mcp({
-  tool: "unica.cfe.init",
-  args: {
-    "cwd": "<workspace>",
-    "Name": "Расш1",
-    "Purpose": "Patch",
-    "CompatibilityMode": "Version8_3_17",
-    "OutputDir": "src",
-    "dryRun": false
-  }
-})
+Поля, которые должен нести записанный файл:
+
+```json
+{
+  "Name": "Расш1",
+  "Purpose": "Patch",
+  "CompatibilityMode": "Version8_3_17",
+  "OutputDir": "src"
+}
 ```
 
 ### Расширение-доработка с версией
 
-```js
-mcp({
-  tool: "unica.cfe.init",
-  args: {
-    "cwd": "<workspace>",
-    "Name": "МоёРасширение",
-    "Version": "1.0.0.1",
-    "Vendor": "Компания",
-    "OutputDir": "src",
-    "dryRun": false
-  }
-})
+Поля, которые должен нести записанный файл:
+
+```json
+{
+  "Name": "МоёРасширение",
+  "Version": "1.0.0.1",
+  "Vendor": "Компания",
+  "OutputDir": "src"
+}
 ```
 
 ### Без роли, с явным префиксом
 
-```js
-mcp({
-  tool: "unica.cfe.init",
-  args: {
-    "cwd": "<workspace>",
-    "Name": "ИсправлениеБага",
-    "NamePrefix": "ИБ_",
-    "Purpose": "Patch",
-    "NoRole": true,
-    "OutputDir": "src",
-    "dryRun": false
-  }
-})
+Поля, которые должен нести записанный файл:
+
+```json
+{
+  "Name": "ИсправлениеБага",
+  "NamePrefix": "ИБ_",
+  "Purpose": "Patch",
+  "NoRole": true,
+  "OutputDir": "src"
+}
 ```
 
 ## Верификация
 
+Проверка расширения — `unica.check` на корне набора-расширения (`ext` — имя набора типа `EXTENSION` в `v8project.yaml`); валидатор `cfe` выбирается по виду набора, вердикт в `data.status`.
+
 ```js
 mcp({
-  tool: "unica.cfe.validate",
+  tool: "unica.check",
   args: {
-    "cwd": "<workspace>",
-    "ExtensionPath": "src/extensions/MyExtension"
+    "at": "ext:Configuration"
   }
 })
 ```

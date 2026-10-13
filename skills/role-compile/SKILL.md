@@ -11,34 +11,37 @@ allowed-tools: bash read write find
 
 Все инструменты `unica.*` вызываются через прокси pi-mcp-adapter: `mcp({ tool: "unica.<tool>", args: { ... } })`; полный список — `mcp({ server: "unica" })`.
 
-- Preferred path: call `mcp({ tool: "unica.role.compile", args: { ... } })`; `unica` owns XML/JSON DSL work and refreshes related workspace caches after mutations.
-- Do not call internal MCP/CLI adapters directly. They are hidden behind `unica` and synchronized by the orchestrator.
-- Execution path: call MCP `unica` tool `unica.role.compile`; skill-local operation scripts are not part of the workflow.
-- For mutating operations, pass `dryRun: false` only when the user explicitly requested the change; otherwise keep the default dry run.
-- Vendor support guard runs inside `unica`; if it blocks a locked/read-only supported object, prefer CFE/release-support or an explicit support-state change plan instead of editing raw support metadata.
+- Preferred path: call `mcp({ tool: "unica.apply", args: { ... } })` с операциями
+  `role.create` и `right.set`.
+- Do not call internal MCP/CLI adapters directly. They are hidden behind
+  `unica` and synchronized by the orchestrator.
+- **Создание метит в корень конфигурации:** `args.at` — это
+  `<набор>:Configuration`, имя роли лежит в `values.name`. Адреса, которого
+  ещё нет, назвать нельзя. Дальнейшие права метят уже в саму роль.
+- Сначала вызови `unica.apply` с `at` и `ops`: это план без записи.
+  Когда пользователь поручил внести эту правку, вызови `unica.apply` только
+  с `executionToken` из `data.executionToken` успешного плана.
+- Роль и все её права публикуются одной транзакцией: либо роль появляется
+  настроенной, либо не появляется вовсе.
+- Каталогов выгрузки и путей к `Rights.xml` тут нет — их место занял адрес.
 
-Принимает JSON-определение роли → генерирует `Roles/Имя.xml` (метаданные) и `Roles/Имя/Ext/Rights.xml` (права). UUID автоматически.
+### Пресеты разворачивает скилл, а не инструмент
 
-## MCP параметры
+`right.set` принимает одно право: `values` с `object`, `right` и хотя бы одним
+из `value` и `rls`. Пресета `@view` инструмент не знает — разверни его сам по
+таблице ниже в набор операций. Так видно, какие именно права выданы, и
+предпросмотр показывает их поимённо, а не имя пресета.
 
-| Параметр | Описание |
-|----------|----------|
-| `JsonPath` | Путь к JSON-определению роли |
-| `OutputDir` | Корень выгрузки конфигурации (где `Configuration.xml`, `Roles/` и т.д.) |
+Объект, ещё не перечисленный в роли, добавляется сам: заводить его отдельно не
+нужно.
 
-```js
-mcp({
-  tool: "unica.role.compile",
-  args: {
-    "cwd": "<workspace>",
-    "JsonPath": "roles/read-products.json",
-    "OutputDir": "src",
-    "dryRun": false
-  }
-})
-```
+### Чего на канонической поверхности нет
 
-Создаёт `{OutputDir}/Roles/Имя.xml` и `{OutputDir}/Roles/Имя/Ext/Rights.xml`. Регистрирует `<Role>` в `Configuration.xml`.
+**Шаблоны RLS.** Операции, создающей `restrictionTemplate`, в реестре нет.
+`right.set` их сохраняет — существующие шаблоны при правке прав не страдают, —
+но объявить новый нечем. Условие ограничения пиши прямо в `values.rls`; если
+нужен именно переиспользуемый шаблон, скажи о пробеле контракта, а не
+подставляй ссылку на шаблон, которого не создашь.
 
 ## JSON DSL
 
@@ -115,16 +118,109 @@ mcp({
 
 Подробные таблицы пресетов, русских синонимов и дополнительные примеры — в `dsl-reference.md`.
 
+## Порядок
+
+1. Имя набора: `unica.view {}`.
+2. Разверни пресеты в явные права по таблице выше.
+3. Предпросмотр: `unica.apply` с `at` и `ops`, `at` в корень конфигурации.
+4. Применение: вызов только с `executionToken` из `data.executionToken` успешного плана.
+5. Проверка: `unica.check {at}` уже по адресу роли.
+
+## Примеры вызова
+
+### Роль с правами одним пакетом
+
+```js
+mcp({
+  tool: "unica.apply",
+  args: {
+    "at": "main:Configuration",
+    "ops": [
+      {
+        "op": "role.create",
+        "args": {
+          "at": "main:Configuration",
+          "values": {
+            "name": "ЧтениеНоменклатуры"
+          }
+        }
+      },
+      {
+        "op": "right.set",
+        "args": {
+          "at": "main:Role.ЧтениеНоменклатуры",
+          "values": {
+            "object": "Catalog.Номенклатура",
+            "right": "Read",
+            "value": true
+          }
+        }
+      },
+      {
+        "op": "right.set",
+        "args": {
+          "at": "main:Role.ЧтениеНоменклатуры",
+          "values": {
+            "object": "Catalog.Номенклатура",
+            "right": "View",
+            "value": true
+          }
+        }
+      }
+    ]
+  }
+})
+```
+
+### Право с ограничением записей
+
+Условие пишется прямо в `values.rls`: шаблон объявить нечем.
+
+Сначала получи план этого изменения:
+
+```js
+mcp({
+  tool: "unica.apply",
+  args: {
+    "at": "main:Role.ЧтениеПоОрганизации",
+    "ops": [
+      {
+        "op": "right.set",
+        "args": {
+          "at": "main:Role.ЧтениеПоОрганизации",
+          "values": {
+            "object": "Document.РеализацияТоваровУслуг",
+            "right": "Read",
+            "value": true,
+            "rls": "ГДЕ Организация = &ТекущаяОрганизация"
+          }
+        }
+      }
+    ]
+  }
+})
+```
+
+Для исполнения передай `data.executionToken` из этого успешного плана:
+
+```js
+mcp({
+  tool: "unica.apply",
+  args: {
+    "executionToken": "<data.executionToken из успешного плана>"
+  }
+})
+```
+
 ## Верификация
 
 ### Проверка корректности XML, прав и RLS
 
 ```js
 mcp({
-  tool: "unica.role.validate",
+  tool: "unica.check",
   args: {
-    "cwd": "<workspace>",
-    "RightsPath": "<RightsPath>"
+    "at": "<набор>:Role.<ИмяРоли>"
   }
 })
 ```
@@ -133,10 +229,9 @@ mcp({
 
 ```js
 mcp({
-  tool: "unica.role.info",
+  tool: "unica.view",
   args: {
-    "cwd": "<workspace>",
-    "RightsPath": "<RightsPath>"
+    "at": "<набор>:Role.<ИмяРоли>"
   }
 })
 ```
